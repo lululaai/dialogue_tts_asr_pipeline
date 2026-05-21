@@ -21,7 +21,8 @@ class PipelineConfig:
     assistant_tts_voice: str = "coral"
 
     tts_model: str = "gpt-4o-mini-tts"
-    asr_model: str = "gpt-4o-transcribe"
+    asr_model: str = "whisper-1"
+    asr_mode: str = "turn"
 
     tts_response_format: str = "wav"
 
@@ -51,4 +52,3 @@ class PipelineConfig:
             self.user_voice_name: "input",
             self.assistant_voice_name: "output",
         }
-

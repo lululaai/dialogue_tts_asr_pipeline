@@ -225,3 +225,59 @@ def transcribe_audio_chunk(
         _dump_json(cache_path, result)
     return result
 
+
+def transcribe_audio_turn_with_word_timestamps(
+    turn_wav_path: str,
+    model: str = "whisper-1",
+    prompt: str | None = None,
+    *,
+    cache_dir: str | Path | None = None,
+    max_retries: int = 5,
+    force: bool = False,
+) -> dict[str, Any]:
+    turn_path = Path(turn_wav_path)
+    if is_silence(turn_path):
+        return {"text": "", "words": [], "skipped": True, "reason": "silence", "text_source": "none"}
+
+    cache_key = _asr_cache_key(turn_path, f"{model}:word_timestamps", prompt)
+    cache_path = Path(cache_dir) / f"{cache_key}.json" if cache_dir is not None else None
+    if cache_path is not None and not force:
+        cached = _load_json(cache_path)
+        if cached is not None:
+            return cached
+
+    if model != "whisper-1":
+        raise ValueError("Turn-level word timestamps require --asr-model whisper-1")
+    if not os.getenv("OPENAI_API_KEY"):
+        raise RuntimeError("OPENAI_API_KEY is required for ASR")
+
+    @retry(
+        retry=retry_if_exception_type(Exception),
+        wait=wait_exponential(multiplier=1, min=1, max=20),
+        stop=stop_after_attempt(max_retries),
+        reraise=True,
+    )
+    def _call_openai() -> dict[str, Any]:
+        from openai import OpenAI
+
+        client = OpenAI()
+        with turn_path.open("rb") as audio_file:
+            kwargs: dict[str, Any] = {
+                "model": model,
+                "file": audio_file,
+                "response_format": "verbose_json",
+                "timestamp_granularities": ["word"],
+            }
+            if prompt:
+                kwargs["prompt"] = prompt
+            response = client.audio.transcriptions.create(**kwargs)
+        data = _response_to_dict(response)
+        data.setdefault("text", "")
+        data.setdefault("words", [])
+        data.setdefault("text_source", "asr_turn_words")
+        return data
+
+    result = _call_openai()
+    if cache_path is not None:
+        _dump_json(cache_path, result)
+    return result

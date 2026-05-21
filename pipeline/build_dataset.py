@@ -17,7 +17,11 @@ from .align_chunks import (
 from .audio_utils import build_stream_tracks, ensure_ffmpeg_available
 from .config import PipelineConfig
 from .load_dialogues import load_dialogues
-from .openai_audio import synthesize_tts, transcribe_audio_chunk
+from .openai_audio import (
+    synthesize_tts,
+    transcribe_audio_chunk,
+    transcribe_audio_turn_with_word_timestamps,
+)
 from .schemas import validate_sample_json
 
 LOGGER = logging.getLogger(__name__)
@@ -48,7 +52,7 @@ def run_pipeline(
     skip_asr: bool = False,
     force: bool = False,
     tts_fn: TTSFn = synthesize_tts,
-    asr_fn: ASRFn = transcribe_audio_chunk,
+    asr_fn: ASRFn | None = None,
 ) -> list[dict[str, Any]]:
     ensure_ffmpeg_available()
     output_dir = Path(config.output_dir)
@@ -113,13 +117,14 @@ def build_sample(
     skip_asr: bool = False,
     force: bool = False,
     tts_fn: TTSFn = synthesize_tts,
-    asr_fn: ASRFn = transcribe_audio_chunk,
+    asr_fn: ASRFn | None = None,
 ) -> dict[str, Any]:
     sample_dir = Path(sample_dir)
     turn_audio_dir = sample_dir / "audio" / "turns"
     audio_dir = sample_dir / "audio"
     chunk_root = audio_dir / "chunks"
-    asr_root = sample_dir / "asr" / "chunks"
+    chunk_asr_root = sample_dir / "asr" / "chunks"
+    turn_asr_root = sample_dir / "asr" / "turns"
     cache_tts_dir = Path(config.output_dir) / "cache" / "tts"
     cache_asr_dir = Path(config.output_dir) / "cache" / "asr"
     turns = [dict(turn) for turn in dialogue["turns"]]
@@ -149,23 +154,39 @@ def build_sample(
     )
     num_chunks = math.ceil(duration_ms / config.chunk_ms) if duration_ms else 0
 
-    asr_results: dict[str, dict[int, dict[str, Any]]] = {
+    chunk_asr_results: dict[str, dict[int, dict[str, Any]]] = {
         config.user_voice_name: {},
         config.assistant_voice_name: {},
     }
+    turn_word_timings: dict[str, list[dict[str, Any]]] = {}
     if config.transcribe_each_chunk and not skip_asr:
-        asr_results = _transcribe_chunks(
-            {
-                config.user_voice_name: user_chunks,
-                config.assistant_voice_name: assistant_chunks,
-            },
-            sample_dir,
-            asr_root,
-            cache_asr_dir,
-            config,
-            force=force,
-            asr_fn=asr_fn,
-        )
+        if config.asr_mode == "turn":
+            turn_asr_fn = asr_fn or transcribe_audio_turn_with_word_timestamps
+            turn_word_timings = _transcribe_turns(
+                turns,
+                turn_audio_dir,
+                turn_asr_root,
+                cache_asr_dir,
+                config,
+                force=force,
+                asr_fn=turn_asr_fn,
+            )
+        elif config.asr_mode == "chunk":
+            chunk_asr_fn = asr_fn or transcribe_audio_chunk
+            chunk_asr_results = _transcribe_chunks(
+                {
+                    config.user_voice_name: user_chunks,
+                    config.assistant_voice_name: assistant_chunks,
+                },
+                sample_dir,
+                chunk_asr_root,
+                cache_asr_dir,
+                config,
+                force=force,
+                asr_fn=chunk_asr_fn,
+            )
+        else:
+            raise ValueError(f"Unsupported asr_mode: {config.asr_mode!r}")
 
     chunk_targets = build_chunk_targets(
         turns,
@@ -173,7 +194,8 @@ def build_sample(
             config.user_voice_name: user_chunks,
             config.assistant_voice_name: assistant_chunks,
         },
-        asr_results,
+        chunk_asr_results,
+        turn_word_timings,
         config,
         num_chunks,
     )
@@ -289,10 +311,60 @@ def _transcribe_chunks(
     return results
 
 
+def _transcribe_turns(
+    turns: list[dict[str, Any]],
+    turn_audio_dir: Path,
+    asr_root: Path,
+    cache_asr_dir: Path,
+    config: PipelineConfig,
+    *,
+    force: bool,
+    asr_fn: ASRFn,
+) -> dict[str, list[dict[str, Any]]]:
+    results: dict[str, list[dict[str, Any]]] = {}
+
+    def _work(turn: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        out_path = asr_root / f"{turn['turn_id']}.json"
+        if out_path.exists() and not force:
+            return turn["turn_id"], json.loads(out_path.read_text(encoding="utf-8"))
+        turn_path = turn_audio_dir / f"{turn['turn_id']}.wav"
+        try:
+            result = asr_fn(
+                str(turn_path),
+                config.asr_model,
+                prompt=turn["message"],
+                cache_dir=cache_asr_dir,
+                max_retries=config.max_retries,
+                force=force,
+            )
+        except Exception as exc:
+            result = {
+                "text": "",
+                "words": [],
+                "error": str(exc),
+                "text_source": "asr_failed",
+            }
+        write_json(out_path, result)
+        return turn["turn_id"], result
+
+    with ThreadPoolExecutor(max_workers=max(1, config.asr_concurrency)) as executor:
+        futures = [executor.submit(_work, turn) for turn in turns]
+        raw_results = {turn_id: result for turn_id, result in (future.result() for future in as_completed(futures))}
+
+    by_turn = {turn["turn_id"]: turn for turn in turns}
+    for turn_id, result in raw_results.items():
+        words = _turn_asr_words_to_global(result, by_turn[turn_id])
+        if words:
+            results[turn_id] = words
+
+    return results
+
+
 def build_chunk_targets(
     turns: list[dict[str, Any]],
     chunks_by_stream: dict[str, list[dict[str, Any]]],
     asr_results: dict[str, dict[int, dict[str, Any]]],
+    turn_word_timings: dict[str, list[dict[str, Any]]] | None,
     config: PipelineConfig,
     num_chunks: int,
 ) -> list[dict[str, Any]]:
@@ -300,6 +372,8 @@ def build_chunk_targets(
         turn["turn_id"]: estimate_word_timings(turn["message"], int(turn["start_ms"]), int(turn["end_ms"]))
         for turn in turns
     }
+    if turn_word_timings:
+        word_timings.update(turn_word_timings)
     chunk_targets: list[dict[str, Any]] = []
     chunk_meta = {
         stream: {chunk["chunk_id"]: chunk for chunk in chunks}
@@ -367,8 +441,12 @@ def _stream_chunk_target(
         }
 
     turn = overlaps[0]
-    fallback_words = words_overlapping_chunk(word_timings[turn["turn_id"]], start_ms, end_ms)
+    overlapping_words = words_overlapping_chunk(word_timings[turn["turn_id"]], start_ms, end_ms)
+    fallback_words = estimate_word_timings(turn["message"], int(turn["start_ms"]), int(turn["end_ms"]))
+    fallback_words = words_overlapping_chunk(fallback_words, start_ms, end_ms)
     fallback_text = _join_tokens([word["word"] for word in fallback_words])
+    timing_text = _join_tokens([word["word"] for word in overlapping_words])
+    has_turn_asr_words = any(word.get("source") == "asr" for word in overlapping_words)
     text = ""
     text_source = "turn_overlap_fallback"
     words = fallback_words
@@ -387,6 +465,10 @@ def _stream_chunk_target(
             text = fallback_text
             text_source = "turn_overlap_fallback"
             words = fallback_words
+    elif has_turn_asr_words:
+        text = timing_text
+        text_source = "asr_turn_words"
+        words = overlapping_words
     elif config.fallback_turn_overlap:
         text = fallback_text
         text_source = "turn_overlap_fallback"
@@ -419,6 +501,34 @@ def _join_tokens(tokens: list[str]) -> str:
     return output
 
 
+def _turn_asr_words_to_global(asr_result: dict[str, Any], turn: dict[str, Any]) -> list[dict[str, Any]]:
+    words: list[dict[str, Any]] = []
+    turn_start_ms = int(turn["start_ms"])
+    turn_end_ms = int(turn["end_ms"])
+    for raw_word in asr_result.get("words") or []:
+        word = raw_word.get("word") or raw_word.get("text") or ""
+        if not word:
+            continue
+        start = raw_word.get("start")
+        end = raw_word.get("end")
+        if start is None or end is None:
+            continue
+        start_ms = turn_start_ms + round(float(start) * 1000)
+        end_ms = turn_start_ms + round(float(end) * 1000)
+        start_ms = max(turn_start_ms, min(start_ms, turn_end_ms))
+        end_ms = max(start_ms, min(end_ms, turn_end_ms))
+        words.append(
+            {
+                "word": word,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "overlap_ratio": 1.0,
+                "source": "asr",
+            }
+        )
+    return words
+
+
 def _serialize_turn(turn: dict[str, Any]) -> dict[str, Any]:
     return {
         "turn_id": turn["turn_id"],
@@ -441,4 +551,3 @@ def _manifest_row(sample: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": sample["duration_ms"],
         "num_chunks": sample["num_chunks"],
     }
-

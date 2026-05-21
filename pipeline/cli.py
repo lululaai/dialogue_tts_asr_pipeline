@@ -31,7 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--user-voice", dest="user_tts_voice", default="alloy")
     parser.add_argument("--assistant-voice", dest="assistant_tts_voice", default="coral")
     parser.add_argument("--tts-model", default="gpt-4o-mini-tts")
-    parser.add_argument("--asr-model", default="gpt-4o-transcribe")
+    parser.add_argument("--asr-model", default="whisper-1")
+    parser.add_argument("--asr-mode", choices=("turn", "chunk"), default="turn")
     parser.add_argument("--tts-response-format", default="wav")
     parser.add_argument("--transcribe-each-chunk", type=parse_bool, default=True)
     parser.add_argument("--limit", type=int)
@@ -68,6 +69,7 @@ def main(argv: list[str] | None = None) -> int:
         assistant_tts_voice=args.assistant_tts_voice,
         tts_model=args.tts_model,
         asr_model=args.asr_model,
+        asr_mode=args.asr_mode,
         tts_response_format=args.tts_response_format,
         inter_turn_silence_ms=args.inter_turn_silence_ms,
         transcribe_each_chunk=args.transcribe_each_chunk,
@@ -89,4 +91,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

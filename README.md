@@ -26,8 +26,23 @@ python3 -m pipeline.cli \
   --user-voice alloy \
   --assistant-voice coral \
   --tts-model gpt-4o-mini-tts \
-  --asr-model gpt-4o-transcribe \
-  --transcribe-each-chunk true
+  --asr-mode turn \
+  --asr-model whisper-1
+```
+
+The default ASR mode is `turn`: each per-turn WAV is transcribed with
+`whisper-1`, requesting word timestamps. Those word timestamps are converted to
+the dialogue timeline and mapped into the fixed 160 ms chunks. This is usually
+more reliable than ASR on each tiny chunk.
+
+The older per-chunk ASR path is still available:
+
+```bash
+python3 -m pipeline.cli \
+  --input-json /path/to/test_freq.json \
+  --output-dir /path/to/output \
+  --asr-mode chunk \
+  --asr-model gpt-4o-transcribe
 ```
 
 Useful flags:
@@ -68,6 +83,7 @@ output/
           user_voice/
           assistant_voice/
       asr/
+        turns/
         chunks/
 ```
 
@@ -81,4 +97,3 @@ Unit tests do not call OpenAI. They mock TTS/ASR and use tiny synthetic WAV file
 ```bash
 pytest
 ```
-
