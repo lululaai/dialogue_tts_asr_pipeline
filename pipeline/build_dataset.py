@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
@@ -14,11 +15,10 @@ from .align_chunks import (
     split_audio_to_chunks,
     words_overlapping_chunk,
 )
-from .audio_utils import build_stream_tracks, ensure_ffmpeg_available
+from .audio_utils import build_stream_tracks, ensure_ffmpeg_available, overlay_backchannel_events
 from .config import PipelineConfig
 from .load_dialogues import load_dialogues
 from .openai_audio import (
-    synthesize_tts,
     transcribe_audio_chunk,
     transcribe_audio_turn_with_word_timestamps,
 )
@@ -43,6 +43,54 @@ def append_jsonl(path: str | Path, data: dict[str, Any]) -> None:
         handle.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
+def _resolve_tts_fn(config: PipelineConfig, tts_fn: TTSFn | None) -> TTSFn:
+    if tts_fn is not None:
+        return tts_fn
+    if config.tts_provider == "google":
+        from .google_audio import synthesize_tts
+
+        return synthesize_tts
+    if config.tts_provider == "openai":
+        from .openai_audio import synthesize_tts
+
+        return synthesize_tts
+    raise ValueError(f"Unsupported tts_provider: {config.tts_provider!r}")
+
+
+def _stable_voice_index(config: PipelineConfig, key: str) -> int:
+    digest = hashlib.sha256(f"{config.tts_model}:{key}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % len(config.google_tts_voices)
+
+
+def _select_dialogue_tts_voices(config: PipelineConfig, sample_id: str) -> dict[str, str]:
+    voice_by_stream = {
+        config.user_voice_name: config.user_tts_voice,
+        config.assistant_voice_name: config.assistant_tts_voice,
+    }
+    if config.tts_provider != "google" or not config.tts_random_voice:
+        return voice_by_stream
+    if not config.google_tts_voices:
+        raise ValueError("--google-tts-voices must include at least one voice")
+
+    user_index = _stable_voice_index(config, f"{sample_id}:{config.user_voice_name}")
+    assistant_index = _stable_voice_index(config, f"{sample_id}:{config.assistant_voice_name}")
+    if len(config.google_tts_voices) > 1 and assistant_index == user_index:
+        assistant_index = (assistant_index + 1) % len(config.google_tts_voices)
+
+    return {
+        config.user_voice_name: config.google_tts_voices[user_index],
+        config.assistant_voice_name: config.google_tts_voices[assistant_index],
+    }
+
+
+def _tts_worker_count(config: PipelineConfig, item_count: int) -> int:
+    if item_count <= 0:
+        return 1
+    if config.tts_concurrency <= 0:
+        return item_count
+    return max(1, config.tts_concurrency)
+
+
 def run_pipeline(
     config: PipelineConfig,
     *,
@@ -51,7 +99,7 @@ def run_pipeline(
     skip_tts: bool = False,
     skip_asr: bool = False,
     force: bool = False,
-    tts_fn: TTSFn = synthesize_tts,
+    tts_fn: TTSFn | None = None,
     asr_fn: ASRFn | None = None,
 ) -> list[dict[str, Any]]:
     ensure_ffmpeg_available()
@@ -64,6 +112,7 @@ def run_pipeline(
         manifest_path.unlink(missing_ok=True)
         failed_path.unlink(missing_ok=True)
 
+    tts_fn = _resolve_tts_fn(config, tts_fn)
     dialogues = load_dialogues(config.input_json, config)
     if limit is not None:
         dialogues = dialogues[:limit]
@@ -116,22 +165,26 @@ def build_sample(
     skip_tts: bool = False,
     skip_asr: bool = False,
     force: bool = False,
-    tts_fn: TTSFn = synthesize_tts,
+    tts_fn: TTSFn | None = None,
     asr_fn: ASRFn | None = None,
 ) -> dict[str, Any]:
     sample_dir = Path(sample_dir)
     turn_audio_dir = sample_dir / "audio" / "turns"
     audio_dir = sample_dir / "audio"
+    backchannel_audio_dir = audio_dir / "backchannels"
     chunk_root = audio_dir / "chunks"
     chunk_asr_root = sample_dir / "asr" / "chunks"
     turn_asr_root = sample_dir / "asr" / "turns"
     cache_tts_dir = Path(config.output_dir) / "cache" / "tts"
     cache_asr_dir = Path(config.output_dir) / "cache" / "asr"
     turns = [dict(turn) for turn in dialogue["turns"]]
+    tts_fn = _resolve_tts_fn(config, tts_fn)
+    tts_voices = _select_dialogue_tts_voices(config, dialogue["sample_id"])
 
     _generate_turn_audio(
         turns,
         config,
+        tts_voices,
         turn_audio_dir,
         cache_tts_dir,
         skip_tts=skip_tts,
@@ -140,73 +193,25 @@ def build_sample(
     )
 
     duration_ms = build_stream_tracks(turns, turn_audio_dir, audio_dir, config)
-    user_chunks = split_audio_to_chunks(
-        audio_dir / f"{config.user_voice_name}.wav",
-        chunk_root / config.user_voice_name,
-        config.chunk_ms,
-        config.sample_rate,
-    )
-    assistant_chunks = split_audio_to_chunks(
-        audio_dir / f"{config.assistant_voice_name}.wav",
-        chunk_root / config.assistant_voice_name,
-        config.chunk_ms,
-        config.sample_rate,
-    )
-    num_chunks = math.ceil(duration_ms / config.chunk_ms) if duration_ms else 0
-
-    chunk_asr_results: dict[str, dict[int, dict[str, Any]]] = {
-        config.user_voice_name: {},
-        config.assistant_voice_name: {},
-    }
-    turn_word_timings: dict[str, list[dict[str, Any]]] = {}
-    if config.transcribe_each_chunk and not skip_asr:
-        if config.asr_mode == "turn":
-            turn_asr_fn = asr_fn or transcribe_audio_turn_with_word_timestamps
-            turn_word_timings = _transcribe_turns(
-                turns,
-                turn_audio_dir,
-                turn_asr_root,
-                cache_asr_dir,
-                config,
-                force=force,
-                asr_fn=turn_asr_fn,
-            )
-        elif config.asr_mode == "chunk":
-            chunk_asr_fn = asr_fn or transcribe_audio_chunk
-            chunk_asr_results = _transcribe_chunks(
-                {
-                    config.user_voice_name: user_chunks,
-                    config.assistant_voice_name: assistant_chunks,
-                },
-                sample_dir,
-                chunk_asr_root,
-                cache_asr_dir,
-                config,
-                force=force,
-                asr_fn=chunk_asr_fn,
-            )
-        else:
-            raise ValueError(f"Unsupported asr_mode: {config.asr_mode!r}")
-
-    chunk_targets = build_chunk_targets(
-        turns,
-        {
-            config.user_voice_name: user_chunks,
-            config.assistant_voice_name: assistant_chunks,
-        },
-        chunk_asr_results,
-        turn_word_timings,
+    backchannel_events = _select_backchannel_events(turns, config)
+    _generate_backchannel_audio(
+        backchannel_events,
         config,
-        num_chunks,
+        tts_voices,
+        backchannel_audio_dir,
+        cache_tts_dir,
+        skip_tts=skip_tts,
+        force=force,
+        tts_fn=tts_fn,
     )
+    duration_ms = overlay_backchannel_events(backchannel_events, sample_dir, audio_dir, config)
+    overlap_events = _build_overlap_events(turns)
 
     sample = {
         "sample_id": dialogue["sample_id"],
         "source_dialogue_id": dialogue["source_dialogue_id"],
-        "chunk_ms": config.chunk_ms,
         "sample_rate": config.sample_rate,
         "duration_ms": duration_ms,
-        "num_chunks": num_chunks,
         "streams": {
             "input": [config.user_voice_name],
             "output": [config.assistant_voice_name],
@@ -214,11 +219,83 @@ def build_sample(
         "audio_files": {
             config.user_voice_name: f"audio/{config.user_voice_name}.wav",
             config.assistant_voice_name: f"audio/{config.assistant_voice_name}.wav",
+            config.stereo_audio_name: f"audio/{config.stereo_audio_name}.wav",
         },
         "turns": [_serialize_turn(turn) for turn in turns],
+        "overlap_events": overlap_events,
+        "backchannel_events": backchannel_events,
+        "tts": {
+            "provider": config.tts_provider,
+            "model": config.tts_model,
+            "speed": config.tts_speed,
+            "random_voice": config.tts_random_voice,
+            "voices": tts_voices,
+        },
         "source_metadata": dialogue.get("source_metadata", {}),
-        "chunk_targets": chunk_targets,
     }
+
+    if config.generate_chunk_targets:
+        user_chunks = split_audio_to_chunks(
+            audio_dir / f"{config.user_voice_name}.wav",
+            chunk_root / config.user_voice_name,
+            config.chunk_ms,
+            config.sample_rate,
+        )
+        assistant_chunks = split_audio_to_chunks(
+            audio_dir / f"{config.assistant_voice_name}.wav",
+            chunk_root / config.assistant_voice_name,
+            config.chunk_ms,
+            config.sample_rate,
+        )
+        num_chunks = math.ceil(duration_ms / config.chunk_ms) if duration_ms else 0
+
+        chunk_asr_results: dict[str, dict[int, dict[str, Any]]] = {
+            config.user_voice_name: {},
+            config.assistant_voice_name: {},
+        }
+        turn_word_timings: dict[str, list[dict[str, Any]]] = {}
+        if config.transcribe_each_chunk and not skip_asr:
+            if config.asr_mode == "turn":
+                turn_asr_fn = asr_fn or transcribe_audio_turn_with_word_timestamps
+                turn_word_timings = _transcribe_turns(
+                    turns,
+                    turn_audio_dir,
+                    turn_asr_root,
+                    cache_asr_dir,
+                    config,
+                    force=force,
+                    asr_fn=turn_asr_fn,
+                )
+            elif config.asr_mode == "chunk":
+                chunk_asr_fn = asr_fn or transcribe_audio_chunk
+                chunk_asr_results = _transcribe_chunks(
+                    {
+                        config.user_voice_name: user_chunks,
+                        config.assistant_voice_name: assistant_chunks,
+                    },
+                    sample_dir,
+                    chunk_asr_root,
+                    cache_asr_dir,
+                    config,
+                    force=force,
+                    asr_fn=chunk_asr_fn,
+                )
+            else:
+                raise ValueError(f"Unsupported asr_mode: {config.asr_mode!r}")
+
+        sample["chunk_ms"] = config.chunk_ms
+        sample["num_chunks"] = num_chunks
+        sample["chunk_targets"] = build_chunk_targets(
+            turns,
+            {
+                config.user_voice_name: user_chunks,
+                config.assistant_voice_name: assistant_chunks,
+            },
+            chunk_asr_results,
+            turn_word_timings,
+            config,
+            num_chunks,
+        )
 
     validate_sample_json(sample, sample_dir)
     write_json(sample_dir / "metadata.json", {k: v for k, v in sample.items() if k != "chunk_targets"})
@@ -229,6 +306,7 @@ def build_sample(
 def _generate_turn_audio(
     turns: list[dict[str, Any]],
     config: PipelineConfig,
+    tts_voices: dict[str, str],
     turn_audio_dir: Path,
     cache_tts_dir: Path,
     *,
@@ -244,7 +322,7 @@ def _generate_turn_audio(
         return
 
     def _work(turn: dict[str, Any]) -> None:
-        voice = config.user_tts_voice if turn["stream"] == config.user_voice_name else config.assistant_tts_voice
+        voice = tts_voices[turn["stream"]]
         tts_fn(
             turn["message"],
             str(turn_audio_dir / f"{turn['turn_id']}.wav"),
@@ -252,13 +330,61 @@ def _generate_turn_audio(
             config.tts_model,
             config.sample_rate,
             config.tts_response_format,
+            speed=config.tts_speed,
             cache_dir=cache_tts_dir,
             max_retries=config.max_retries,
             force=force,
         )
 
-    with ThreadPoolExecutor(max_workers=max(1, config.tts_concurrency)) as executor:
+    with ThreadPoolExecutor(max_workers=_tts_worker_count(config, len(turns))) as executor:
         futures = [executor.submit(_work, turn) for turn in turns]
+        for future in as_completed(futures):
+            future.result()
+
+
+def _generate_backchannel_audio(
+    backchannel_events: list[dict[str, Any]],
+    config: PipelineConfig,
+    tts_voices: dict[str, str],
+    backchannel_audio_dir: Path,
+    cache_tts_dir: Path,
+    *,
+    skip_tts: bool,
+    force: bool,
+    tts_fn: TTSFn,
+) -> None:
+    if not backchannel_events:
+        return
+
+    backchannel_audio_dir.mkdir(parents=True, exist_ok=True)
+    if skip_tts:
+        missing = [
+            event["event_id"]
+            for event in backchannel_events
+            if not (backchannel_audio_dir / f"{event['event_id']}.wav").exists()
+        ]
+        if missing:
+            raise FileNotFoundError(f"--skip-tts requires existing backchannel wav files; missing: {missing}")
+        return
+
+    def _work(event: dict[str, Any]) -> None:
+        voice = tts_voices[event["stream"]]
+        tts_fn(
+            event["text"],
+            str(backchannel_audio_dir / f"{event['event_id']}.wav"),
+            voice,
+            config.tts_model,
+            config.sample_rate,
+            config.tts_response_format,
+            instructions="Say this as a brief, natural, low-key listener backchannel.",
+            speed=config.tts_speed,
+            cache_dir=cache_tts_dir,
+            max_retries=config.max_retries,
+            force=force,
+        )
+
+    with ThreadPoolExecutor(max_workers=_tts_worker_count(config, len(backchannel_events))) as executor:
+        futures = [executor.submit(_work, event) for event in backchannel_events]
         for future in as_completed(futures):
             future.result()
 
@@ -529,6 +655,178 @@ def _turn_asr_words_to_global(asr_result: dict[str, Any], turn: dict[str, Any]) 
     return words
 
 
+def _select_backchannel_events(turns: list[dict[str, Any]], config: PipelineConfig) -> list[dict[str, Any]]:
+    if not config.backchannel_enabled or config.backchannel_max_count <= 0 or not config.backchannel_phrases:
+        return []
+
+    candidates = [
+        turn
+        for turn in turns
+        if int(turn["end_ms"]) - int(turn["start_ms"]) >= config.backchannel_min_turn_duration_ms
+    ]
+    if not candidates:
+        return []
+
+    selected = _spread_items(candidates, len(candidates))
+    events: list[dict[str, Any]] = []
+    ratios = (0.45, 0.62, 0.78)
+    estimated_duration_ms = config.backchannel_max_duration_ms
+
+    while len(events) < config.backchannel_max_count:
+        made_progress = False
+        for turn in selected:
+            if len(events) >= config.backchannel_max_count:
+                break
+
+            speaker_stream = turn["stream"]
+            listener_stream = (
+                config.assistant_voice_name
+                if speaker_stream == config.user_voice_name
+                else config.user_voice_name
+            )
+            listener_agent = (
+                config.assistant_agent
+                if listener_stream == config.assistant_voice_name
+                else config.user_agent
+            )
+            turn_start_ms = int(turn["start_ms"])
+            turn_end_ms = int(turn["end_ms"])
+            turn_duration_ms = turn_end_ms - turn_start_ms
+            start_ms = _find_backchannel_start_ms(
+                turns,
+                events,
+                listener_stream,
+                turn_start_ms,
+                turn_duration_ms,
+                ratios,
+                estimated_duration_ms,
+                config.backchannel_min_start_offset_ms,
+                config.backchannel_min_end_margin_ms,
+            )
+            if start_ms is None:
+                continue
+
+            phrase = config.backchannel_phrases[len(events) % len(config.backchannel_phrases)]
+            event_id = f"bc_{len(events) + 1:06d}"
+            events.append(
+                {
+                    "event_id": event_id,
+                    "text": phrase,
+                    "agent": listener_agent,
+                    "stream": listener_stream,
+                    "while_turn_id": turn["turn_id"],
+                    "while_turn_stream": speaker_stream,
+                    "while_turn_start_ms": turn_start_ms,
+                    "while_turn_end_ms": turn_end_ms,
+                    "start_ms": start_ms,
+                    "end_ms": None,
+                    "duration_ms": None,
+                    "audio_path": f"audio/backchannels/{event_id}.wav",
+                }
+            )
+            made_progress = True
+
+        if not made_progress:
+            break
+
+    return events
+
+
+def _spread_items(items: list[dict[str, Any]], target_count: int) -> list[dict[str, Any]]:
+    if target_count <= 0:
+        return []
+    if target_count == 1:
+        return [items[len(items) // 2]]
+
+    selected: list[dict[str, Any]] = []
+    last_slot = len(items) - 1
+    for slot in range(target_count):
+        item = items[round(slot * last_slot / (target_count - 1))]
+        if item not in selected:
+            selected.append(item)
+    return selected
+
+
+def _find_backchannel_start_ms(
+    turns: list[dict[str, Any]],
+    existing_events: list[dict[str, Any]],
+    listener_stream: str,
+    turn_start_ms: int,
+    turn_duration_ms: int,
+    ratios: tuple[float, ...],
+    estimated_duration_ms: int,
+    min_start_offset_ms: int,
+    min_end_margin_ms: int,
+) -> int | None:
+    earliest_ms = turn_start_ms + min_start_offset_ms
+    latest_ms = turn_start_ms + turn_duration_ms - estimated_duration_ms - min_end_margin_ms
+    if latest_ms < earliest_ms:
+        return None
+
+    for ratio in ratios:
+        start_ms = turn_start_ms + round(turn_duration_ms * ratio)
+        start_ms = min(max(start_ms, earliest_ms), latest_ms)
+        end_ms = start_ms + estimated_duration_ms
+        if _stream_has_formal_speech(turns, listener_stream, start_ms, end_ms):
+            continue
+        if _stream_has_backchannel(existing_events, listener_stream, start_ms, end_ms, estimated_duration_ms):
+            continue
+        return start_ms
+    return None
+
+
+def _stream_has_backchannel(
+    events: list[dict[str, Any]],
+    stream: str,
+    start_ms: int,
+    end_ms: int,
+    estimated_duration_ms: int,
+) -> bool:
+    for event in events:
+        if event.get("stream") != stream:
+            continue
+        event_start_ms = int(event["start_ms"])
+        event_end_ms = int(event.get("end_ms") or event_start_ms + estimated_duration_ms)
+        if max(0, min(event_end_ms + 120, end_ms) - max(event_start_ms - 120, start_ms)) > 0:
+            return True
+    return False
+
+
+def _stream_has_formal_speech(
+    turns: list[dict[str, Any]],
+    stream: str,
+    start_ms: int,
+    end_ms: int,
+) -> bool:
+    for turn in turns:
+        if turn.get("stream") != stream:
+            continue
+        if max(0, min(int(turn["end_ms"]), end_ms) - max(int(turn["start_ms"]), start_ms)) > 0:
+            return True
+    return False
+
+
+def _build_overlap_events(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    by_id = {turn["turn_id"]: turn for turn in turns}
+    for turn in turns:
+        previous_turn_id = turn.get("overlap_previous_turn_id")
+        if not previous_turn_id:
+            continue
+        previous = by_id[previous_turn_id]
+        events.append(
+            {
+                "turn_id": turn["turn_id"],
+                "overlaps_turn_id": previous_turn_id,
+                "start_ms": turn["start_ms"],
+                "overlap_start_ms": turn["start_ms"],
+                "overlap_end_ms": previous["end_ms"],
+                "overlap_ms": turn.get("overlap_ms", 0),
+            }
+        )
+    return events
+
+
 def _serialize_turn(turn: dict[str, Any]) -> dict[str, Any]:
     return {
         "turn_id": turn["turn_id"],
@@ -538,6 +836,9 @@ def _serialize_turn(turn: dict[str, Any]) -> dict[str, Any]:
         "start_ms": turn["start_ms"],
         "end_ms": turn["end_ms"],
         "text": turn["message"],
+        "overlap_with_previous": turn.get("overlap_with_previous", False),
+        "overlap_previous_turn_id": turn.get("overlap_previous_turn_id"),
+        "overlap_ms": turn.get("overlap_ms", 0),
         "sentiment": turn.get("sentiment"),
         "source_metadata": turn.get("source_metadata", {}),
     }
@@ -549,5 +850,6 @@ def _manifest_row(sample: dict[str, Any]) -> dict[str, Any]:
         "source_dialogue_id": sample["source_dialogue_id"],
         "sample_json": f"samples/{sample['sample_id']}/sample.json",
         "duration_ms": sample["duration_ms"],
-        "num_chunks": sample["num_chunks"],
+        "num_chunks": sample.get("num_chunks", 0),
+        "num_overlaps": len(sample.get("overlap_events", [])),
     }
