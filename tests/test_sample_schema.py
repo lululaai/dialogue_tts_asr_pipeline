@@ -11,6 +11,8 @@ from conftest import fake_tts
 
 
 def test_sample_json_validates_and_marks_silence(config):
+    config.generate_chunk_targets = True
+    config.turn_overlap_enabled = False
     dialogue = load_dialogues(config.input_json, config)[0]
     sample_dir = Path(config.output_dir) / "samples" / "dialogue_000001"
     sample = build_sample(dialogue, config, sample_dir, tts_fn=fake_tts, skip_asr=True)
@@ -32,6 +34,8 @@ def test_turn_asr_words_are_mapped_to_chunks(tmp_path, tiny_input):
         transcribe_each_chunk=True,
         asr_mode="turn",
         asr_model="whisper-1",
+        generate_chunk_targets=True,
+        turn_overlap_enabled=False,
         tts_concurrency=1,
         asr_concurrency=1,
     )

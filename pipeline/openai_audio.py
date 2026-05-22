@@ -41,6 +41,7 @@ def _load_json(path: Path) -> dict[str, Any] | None:
 def _tts_cache_key(
     text: str,
     voice: str,
+    speed: float,
     model: str,
     sample_rate: int,
     response_format: str,
@@ -51,6 +52,7 @@ def _tts_cache_key(
             {
                 "model": model,
                 "voice": voice,
+                "speed": speed,
                 "response_format": response_format,
                 "sample_rate": sample_rate,
                 "instructions": instructions,
@@ -101,6 +103,7 @@ def synthesize_tts(
     sample_rate: int,
     response_format: str = "wav",
     instructions: str | None = None,
+    speed: float = 1.0,
     *,
     cache_dir: str | Path | None = None,
     max_retries: int = 5,
@@ -111,10 +114,11 @@ def synthesize_tts(
 
     output_path = Path(output_wav_path)
     metadata_path = output_path.with_suffix(output_path.suffix + ".json")
-    cache_key = _tts_cache_key(text, voice, model, sample_rate, response_format, instructions)
+    cache_key = _tts_cache_key(text, voice, speed, model, sample_rate, response_format, instructions)
     metadata = {
         "text": text,
         "voice": voice,
+        "speed": speed,
         "model": model,
         "sample_rate": sample_rate,
         "response_format": response_format,
@@ -153,6 +157,7 @@ def synthesize_tts(
             "voice": voice,
             "input": text,
             "response_format": response_format,
+            "speed": speed,
         }
         if instructions:
             kwargs["instructions"] = instructions
