@@ -80,7 +80,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sfx-enabled", type=parse_bool, default=False)
     parser.add_argument("--sfx-map-path", default="uploaded_segments_map_to_file.json")
     parser.add_argument("--sfx-root", default="sfx")
-    parser.add_argument("--sfx-planner-model", default="gemini-2.5-flash")
+    parser.add_argument("--sfx-planner-model", default="gemini-3.5-flash")
     parser.add_argument("--sfx-max-events", type=int, default=4)
     parser.add_argument("--sfx-default-gain-db", type=float, default=-18.0)
     parser.add_argument("--sfx-ducking-db", type=float, default=-2.0)

@@ -116,7 +116,7 @@ class PipelineConfig:
     sfx_enabled: bool = False
     sfx_map_path: str = "uploaded_segments_map_to_file.json"
     sfx_root: str = "sfx"
-    sfx_planner_model: str = "gemini-2.5-flash"
+    sfx_planner_model: str = "gemini-3.5-flash"
     sfx_max_events: int = 4
     sfx_default_gain_db: float = -18.0
     sfx_ducking_db: float = -2.0

@@ -87,7 +87,7 @@ Useful overlap and batch flags:
 --sfx-enabled true
 --sfx-root sfx
 --sfx-map-path uploaded_segments_map_to_file.json
---sfx-planner-model gemini-2.5-flash
+--sfx-planner-model gemini-3.5-flash
 --sfx-max-events 4
 --sample-concurrency 4
 --tts-concurrency 4
