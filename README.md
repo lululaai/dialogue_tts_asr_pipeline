@@ -61,12 +61,13 @@ pipeline synthesizes short listener responses such as `yes`, `yeah`, or `right`
 with the listener's voice and overlays them quietly on the listener stream.
 These do not become dialogue turns; they are recorded in `backchannel_events`.
 
-Optional SFX mixing can add a sparse human-sound layer on top of
-`duplex_stereo.wav`. It uses a Google Gemini text model to plan events, but the
-actual event audio is selected only from `uploaded_segments_map_to_file.json`
-and local files under `sfx/audio_segments/...`, matching the TOS key layout.
-The original stereo file is preserved and the mixed file is written as
-`audio/duplex_stereo_sfx.wav`.
+Optional SFX mixing can add a sparse scene-grounded sound layer on top of
+`duplex_stereo.wav`. It uses a Google Gemini text model to choose one dialogue
+scene from 20 presets, then plan event labels, start/end timing, duration, and
+intensity. The actual event audio is selected only from
+`uploaded_segments_map_to_file.json` and local files under
+`sfx/audio_segments/...`, matching the TOS key layout. The original stereo file
+is preserved and the mixed file is written as `audio/duplex_stereo_sfx.wav`.
 
 Useful overlap and batch flags:
 

@@ -31,11 +31,121 @@ class SfxEvent:
     gain_db: float
     ducking_db: float
     reason: str
+    scene: str | None = None
+    intensity: int | None = None
     asset_path: str | None = None
     end_ms: int | None = None
 
 
 SfxCatalog = dict[tuple[str, str], list[SfxAsset]]
+
+SFX_EVENT_MIN_DURATION_MS = 150
+SFX_EVENT_MAX_DURATION_MS = 12000
+
+SFX_SCENES: list[dict[str, Any]] = [
+    {
+        "scene": "indoor_argument",
+        "cues": ["argument", "angry exchange", "tense voices", "fight in a room"],
+        "sound_profile": "tight indoor room tone, restrained body movement, occasional object handling.",
+    },
+    {
+        "scene": "office_talk",
+        "cues": ["office", "coworker", "meeting", "computer", "desk", "paperwork"],
+        "sound_profile": "quiet office ambience, keyboard or paper details, distant lobby noise.",
+    },
+    {
+        "scene": "indoor_room_chat",
+        "cues": ["home", "bedroom", "living room", "private indoor conversation"],
+        "sound_profile": "soft room tone, small household movement, low non-distracting ambience.",
+    },
+    {
+        "scene": "restaurant_chat",
+        "cues": ["restaurant", "dinner", "server", "menu", "meal"],
+        "sound_profile": "light restaurant crowd bed, dishes or cutlery only when text supports it.",
+    },
+    {
+        "scene": "rainy_street_chat",
+        "cues": ["rain", "wet street", "umbrella", "stormy walk", "drizzle outside"],
+        "sound_profile": "rain or wet traffic ambience, occasional footsteps or vehicles.",
+    },
+    {
+        "scene": "sunny_street_chat",
+        "cues": ["street", "walking outside", "sunny day", "sidewalk", "city"],
+        "sound_profile": "gentle urban ambience, light traffic, pedestrians, no rain.",
+    },
+    {
+        "scene": "cafe_chat",
+        "cues": ["cafe", "coffee", "barista", "espresso", "tea shop"],
+        "sound_profile": "small cafe ambience, cups, register, espresso machine when cued.",
+    },
+    {
+        "scene": "library_study_chat",
+        "cues": ["library", "study", "books", "quiet reading", "homework"],
+        "sound_profile": "very quiet room tone, page turns, soft paper movement, minimal crowd.",
+    },
+    {
+        "scene": "factory_workshop_chat",
+        "cues": ["factory", "workshop", "machine shop", "tools", "industrial work"],
+        "sound_profile": "low industrial ambience, tools or machinery only if dialogue clearly points there.",
+    },
+    {
+        "scene": "after_exercise_chat",
+        "cues": ["gym", "workout", "running", "sports practice", "tired after exercise"],
+        "sound_profile": "breathing, clothing movement, gym or sports ambience at low level.",
+    },
+    {
+        "scene": "kitchen_cooking_chat",
+        "cues": ["kitchen", "cooking", "pan", "recipe", "dishes", "food prep"],
+        "sound_profile": "light appliance hum, cooking sizzle, water or dish sounds when cued.",
+    },
+    {
+        "scene": "car_interior_chat",
+        "cues": ["car", "driving", "road trip", "traffic from inside", "passenger"],
+        "sound_profile": "vehicle interior tone, subdued road noise, turn signal or horn only when cued.",
+    },
+    {
+        "scene": "public_transport_chat",
+        "cues": ["bus", "subway", "train ride", "commute", "platform"],
+        "sound_profile": "transit ambience, doors, announcements, vehicle motion when grounded.",
+    },
+    {
+        "scene": "park_walk_chat",
+        "cues": ["park", "walk", "grass", "trees", "picnic"],
+        "sound_profile": "outdoor nature ambience, footsteps, birds or wind if consistent with text.",
+    },
+    {
+        "scene": "hospital_clinic_chat",
+        "cues": ["hospital", "clinic", "doctor", "nurse", "appointment", "medical"],
+        "sound_profile": "quiet clinical room tone, soft equipment beeps or hallway ambience when cued.",
+    },
+    {
+        "scene": "school_classroom_chat",
+        "cues": ["school", "class", "teacher", "classroom", "students"],
+        "sound_profile": "classroom room tone, paper, chairs, distant student ambience.",
+    },
+    {
+        "scene": "shopping_mall_chat",
+        "cues": ["mall", "store", "shopping", "cashier", "checkout"],
+        "sound_profile": "retail ambience, register, footsteps, crowd bed at low level.",
+    },
+    {
+        "scene": "airport_station_chat",
+        "cues": ["airport", "station", "flight", "gate", "luggage", "departure"],
+        "sound_profile": "transport hub ambience, rolling luggage, announcements when text supports them.",
+    },
+    {
+        "scene": "beach_lakeside_chat",
+        "cues": ["beach", "lake", "ocean", "shore", "swimming"],
+        "sound_profile": "water and wind ambience, birds or splashes only when appropriate.",
+    },
+    {
+        "scene": "nighttime_quiet_chat",
+        "cues": ["night", "late", "sleepy", "quiet house", "whispering"],
+        "sound_profile": "very low room tone, soft movements, avoid busy ambience.",
+    },
+]
+
+SFX_SCENE_NAMES = {scene["scene"] for scene in SFX_SCENES}
 
 
 def mix_sample_sfx(
@@ -70,6 +180,8 @@ def mix_sample_sfx(
         "model": config.sfx_planner_model,
         "map_path": config.sfx_map_path,
         "root": config.sfx_root,
+        "scene": _plan_scene(plan),
+        "scene_reason": str(plan.get("scene_reason") or "") if isinstance(plan, dict) else "",
     }
     sample["sfx_events"] = [_event_dict(event, sample_dir) for event in events]
     return sample
@@ -156,23 +268,31 @@ def _build_prompt(
             "task": "Create a sparse, dialogue-safe sound-effect plan for a stereo two-speaker dialogue mix.",
             "rules": [
                 "Return only valid JSON.",
+                "First choose one scene from available_scenes that best fits the dialogue. If no scene is explicit, infer the most natural low-risk scene from the text.",
                 "Use only category/label pairs from available_sfx_labels.",
-                "Choose each event by the strongest cue in the dialogue text: named places, objects, activities, sports, vehicles, weather, animals, music, machines, doors, phones, crowds, or clear speaker reactions.",
+                "Choose each event by the strongest cue in the dialogue text, combining that cue with the selected scene: named places, objects, activities, sports, vehicles, weather, animals, music, machines, doors, phones, crowds, or clear speaker reactions.",
+                "The selected scene is a grounding constraint, not permission to add generic ambience. Events still need a clear dialogue cue or a scene-consistent gap-filling reason.",
                 "Do not prefer any category by default. Human sounds are appropriate for explicit laughter, sighs, breaths, coughs, exertion, or other speaker reactions; non-human sounds are appropriate when the dialogue provides a concrete contextual cue.",
-                "Prefer precise, localized effects over broad ambience. For example, a mentioned football game can justify a quiet sports crowd or whistle, while a mentioned door can justify a door sound.",
+                "Prefer precise, localized effects over broad ambience. Use ambience only when the selected scene is strongly implied and a short bed would improve realism.",
                 "If multiple categories fit, pick the one that best matches the specific textual cue, not the safest or most generic category.",
                 "Do not invent unrelated off-screen events just to make the mix busy; if there is no meaningful textual cue, return fewer events or no event.",
                 "Use at most max_events events.",
-                "Prefer placing events in dialogue gaps. If an event overlaps speech, keep gain_db quiet.",
+                "Choose start_ms and end_ms flexibly from the timeline. Prefer dialogue gaps, but allow quiet overlap when a scene bed or reaction naturally sits under speech.",
+                "Choose duration_ms from the event type: short foley/reactions 150-1200 ms, object actions 300-2500 ms, ambience/weather/traffic/crowd beds 1500-12000 ms. Keep each event inside duration_ms.",
+                "Choose intensity from 1 to 5 and map it to gain_db: 1 is barely audible around -32 to -28 dB, 2 is subtle around -28 to -23 dB, 3 is present around -23 to -18 dB, 4 is noticeable around -18 to -12 dB, 5 is foreground around -12 to -6 dB and should be rare.",
+                "If an event overlaps speech, use intensity 1-2, gain_db <= -20, and ducking_db between -4 and -1 unless the dialogue explicitly calls for a foreground sound.",
                 "Avoid loud impacts, horror, violence, or distracting sounds unless the dialogue explicitly calls for that kind of sound.",
-                "Output schema: {\"events\":[{\"category\":\"Human sounds\",\"label\":\"laughter\",\"start_ms\":1234,\"duration_ms\":900,\"gain_db\":-20,\"ducking_db\":-2,\"reason\":\"short reason\"}]}",
+                "Output schema: {\"scene\":\"cafe_chat\",\"scene_reason\":\"short reason\",\"events\":[{\"scene\":\"cafe_chat\",\"category\":\"Human sounds\",\"label\":\"laughter\",\"start_ms\":1234,\"end_ms\":2134,\"duration_ms\":900,\"intensity\":2,\"gain_db\":-24,\"ducking_db\":-2,\"reason\":\"short reason\"}]}",
             ],
             "selection_policy": {
-                "priority": "Match the dialogue content first, then choose the quietest event that supports that content.",
+                "priority": "Select the best scene first, then match dialogue content, then choose the quietest event that supports that content.",
                 "category_balance": "Use Human sounds only when the cue is human; use non-human categories when the cue is an object, place, activity, environment, animal, vehicle, music, or crowd.",
+                "timing": "Use dialogue_gaps for clean placement when possible. For ambience beds, align with a natural span of the conversation instead of forcing a fixed length.",
+                "intensity": "Most events should be intensity 1-3. Use intensity 4-5 only for explicit foreground actions.",
                 "silence_is_ok": "Return fewer than max_events if extra sounds would feel ungrounded or repetitive.",
             },
             "max_events": config.sfx_max_events,
+            "available_scenes": SFX_SCENES,
             "duration_ms": sample["duration_ms"],
             "available_sfx_labels": labels,
             "dialogue_gaps": gaps[:24],
@@ -210,6 +330,7 @@ def _sanitize_plan(
     events: list[SfxEvent] = []
     duration_ms = int(sample["duration_ms"])
     raw_events = plan.get("events") if isinstance(plan, dict) else None
+    plan_scene = _normalize_scene(plan.get("scene")) if isinstance(plan, dict) else None
     for raw in raw_events or []:
         if not isinstance(raw, dict):
             continue
@@ -218,10 +339,10 @@ def _sanitize_plan(
         if (category, label) not in catalog:
             continue
         start_ms = int(max(0, min(duration_ms - 1, int(raw.get("start_ms") or 0))))
-        event_duration = int(raw.get("duration_ms") or 1000)
-        event_duration = max(200, min(5000, event_duration, duration_ms - start_ms))
+        event_duration = _event_duration_from_plan(raw, start_ms, duration_ms)
         gain_db = _clamp_float(raw.get("gain_db"), -36.0, -6.0, config.sfx_default_gain_db)
         ducking_db = _clamp_float(raw.get("ducking_db"), -8.0, 0.0, config.sfx_ducking_db)
+        intensity = _clamp_intensity(raw.get("intensity"))
         events.append(
             SfxEvent(
                 event_id=f"sfx_{len(events) + 1:03d}",
@@ -232,6 +353,8 @@ def _sanitize_plan(
                 gain_db=round(gain_db, 2),
                 ducking_db=round(ducking_db, 2),
                 reason=str(raw.get("reason") or ""),
+                scene=_normalize_scene(raw.get("scene")) or plan_scene,
+                intensity=intensity,
             )
         )
         if len(events) >= max(0, config.sfx_max_events):
@@ -266,8 +389,55 @@ def _fallback_events(
             gain_db=config.sfx_default_gain_db,
             ducking_db=config.sfx_ducking_db,
             reason="fallback sparse human sound",
+            scene="indoor_room_chat",
+            intensity=2,
         )
     ]
+
+
+def _normalize_scene(value: object) -> str | None:
+    scene = str(value or "").strip()
+    if scene in SFX_SCENE_NAMES:
+        return scene
+    return None
+
+
+def _plan_scene(plan: object) -> str | None:
+    if not isinstance(plan, dict):
+        return None
+    scene = _normalize_scene(plan.get("scene"))
+    if scene:
+        return scene
+    for raw in plan.get("events") or []:
+        if isinstance(raw, dict):
+            scene = _normalize_scene(raw.get("scene"))
+            if scene:
+                return scene
+    return None
+
+
+def _event_duration_from_plan(raw: dict[str, Any], start_ms: int, sample_duration_ms: int) -> int:
+    remaining_ms = max(1, sample_duration_ms - start_ms)
+    duration_value = raw.get("duration_ms")
+    if duration_value is None and raw.get("end_ms") is not None:
+        try:
+            duration_value = int(raw["end_ms"]) - start_ms
+        except (TypeError, ValueError):
+            duration_value = None
+    try:
+        event_duration = int(duration_value) if duration_value is not None else 1000
+    except (TypeError, ValueError):
+        event_duration = 1000
+    return max(SFX_EVENT_MIN_DURATION_MS, min(SFX_EVENT_MAX_DURATION_MS, event_duration, remaining_ms))
+
+
+def _clamp_intensity(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        return max(1, min(5, int(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _clamp_float(value: object, low: float, high: float, default: float) -> float:
@@ -382,6 +552,8 @@ def _event_dict(event: SfxEvent, sample_dir: Path) -> dict[str, Any]:
         "duration_ms": event.duration_ms,
         "gain_db": event.gain_db,
         "ducking_db": event.ducking_db,
+        "scene": event.scene,
+        "intensity": event.intensity,
         "asset_path": asset_path,
         "reason": event.reason,
     }

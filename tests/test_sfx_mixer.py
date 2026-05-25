@@ -7,7 +7,7 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from pipeline.config import PipelineConfig
-from pipeline.sfx_mixer import SfxAsset, _build_prompt, load_sfx_catalog, mix_sample_sfx
+from pipeline.sfx_mixer import SfxAsset, SFX_SCENES, _build_prompt, load_sfx_catalog, mix_sample_sfx
 
 
 def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
@@ -75,12 +75,16 @@ def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
 
     def fake_generate_json(*_, **__):
         return {
+            "scene": "indoor_room_chat",
+            "scene_reason": "the funny line happens in a simple indoor conversation",
             "events": [
                 {
+                    "scene": "indoor_room_chat",
                     "category": "Human sounds",
                     "label": "laughter",
                     "start_ms": 700,
-                    "duration_ms": 400,
+                    "end_ms": 1100,
+                    "intensity": 4,
                     "gain_db": -12,
                     "ducking_db": -1,
                     "reason": "laughter after funny line",
@@ -105,8 +109,12 @@ def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
     assert mixed_path.exists()
     assert mixed_sample["audio_files"]["duplex_stereo_sfx"] == "audio/duplex_stereo_sfx.wav"
     assert len(mixed_sample["sfx_events"]) == 1
+    assert mixed_sample["sfx"]["scene"] == "indoor_room_chat"
     assert mixed_sample["sfx_events"][0]["category"] == "Human sounds"
     assert mixed_sample["sfx_events"][0]["label"] == "laughter"
+    assert mixed_sample["sfx_events"][0]["scene"] == "indoor_room_chat"
+    assert mixed_sample["sfx_events"][0]["intensity"] == 4
+    assert mixed_sample["sfx_events"][0]["duration_ms"] == 400
     assert mixed_sample["sfx_events"][0]["asset_path"].endswith("laugh_asset__part001.wav")
     assert AudioSegment.from_file(mixed_path).channels == 2
 
@@ -135,8 +143,17 @@ def test_sfx_prompt_matches_dialogue_cues_without_category_bias(tmp_path):
     config = PipelineConfig(input_json="input.json", output_dir=str(tmp_path / "out"))
 
     prompt = _build_prompt(sample, catalog, config)
+    prompt_data = json.loads(prompt)
 
+    assert len(SFX_SCENES) == 20
+    assert len(prompt_data["available_scenes"]) == 20
+    assert "indoor_argument" in prompt
+    assert "restaurant_chat" in prompt
+    assert "rainy_street_chat" in prompt
+    assert "factory_workshop_chat" in prompt
     assert "Do not prefer any category by default" in prompt
     assert "Choose each event by the strongest cue in the dialogue text" in prompt
     assert "Use Human sounds only when the cue is human" in prompt
+    assert "Choose start_ms and end_ms flexibly" in prompt
+    assert "Choose intensity from 1 to 5" in prompt
     assert "doors_windows_locks" in prompt
