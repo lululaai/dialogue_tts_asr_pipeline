@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from pydub import AudioSegment
@@ -52,6 +53,38 @@ def test_run_pipeline_processes_samples_concurrently_and_writes_manifest(tmp_pat
         sample_dir = Path(config.output_dir) / "samples" / f"dialogue_{index:06d}"
         assert (sample_dir / "sample.json").exists()
         assert (sample_dir / "audio/duplex_stereo.wav").exists()
+
+
+def test_run_pipeline_logs_elapsed_time_and_processed_data(tmp_path, caplog):
+    input_path = tmp_path / "input.json"
+    _write_multi_input(input_path, count=2)
+    config = PipelineConfig(
+        input_json=str(input_path),
+        output_dir=str(tmp_path / "out"),
+        sample_concurrency=1,
+        tts_concurrency=1,
+        asr_concurrency=1,
+        turn_overlap_enabled=False,
+        backchannel_enabled=False,
+    )
+
+    caplog.set_level(logging.INFO, logger="pipeline.build_dataset")
+
+    rows = run_pipeline(config, tts_fn=fake_tts, skip_asr=True)
+
+    assert len(rows) == 2
+    assert rows[0]["num_turns"] == 2
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Starting pipeline: samples=2" in message for message in messages)
+    assert any(
+        "Pipeline progress 2/2" in message
+        and "elapsed=" in message
+        and "rate=" in message
+        and "audio_min=" in message
+        and "turns=4" in message
+        for message in messages
+    )
+    assert any("Finished pipeline: samples=2 succeeded=2 failed=0" in message for message in messages)
 
 
 def test_resume_with_sfx_only_fills_missing_sfx_output(tmp_path, monkeypatch):

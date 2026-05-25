@@ -4,7 +4,9 @@ import json
 import logging
 import math
 import hashlib
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -30,6 +32,12 @@ LOGGER = logging.getLogger(__name__)
 
 TTSFn = Callable[..., None]
 ASRFn = Callable[..., dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class SampleResult:
+    row: dict[str, Any]
+    status: str
 
 
 def write_json(path: str | Path, data: dict[str, Any]) -> None:
@@ -93,6 +101,15 @@ def _tts_worker_count(config: PipelineConfig, item_count: int) -> int:
     return max(1, config.tts_concurrency)
 
 
+def _format_elapsed(seconds: float) -> str:
+    seconds = max(0, round(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes:d}:{seconds:02d}"
+
+
 def run_pipeline(
     config: PipelineConfig,
     *,
@@ -123,19 +140,46 @@ def run_pipeline(
 
     manifest_rows: list[dict[str, Any]] = []
     worker_count = max(1, config.sample_concurrency)
+    total = len(dialogues)
+    started_at = time.perf_counter()
+    stats = {
+        "generated": 0,
+        "resumed": 0,
+        "resumed_sfx": 0,
+        "failed": 0,
+        "duration_ms": 0,
+        "turns": 0,
+        "chunks": 0,
+        "overlap_events": 0,
+        "backchannel_events": 0,
+        "sfx_events": 0,
+    }
+    LOGGER.info(
+        "Starting pipeline: samples=%s sample_concurrency=%s tts_concurrency=%s "
+        "asr_concurrency=%s google_request_concurrency=%s sfx_enabled=%s resume=%s",
+        total,
+        worker_count,
+        config.tts_concurrency,
+        config.asr_concurrency,
+        config.google_request_concurrency,
+        config.sfx_enabled,
+        resume,
+    )
 
-    def _process(dialogue: dict[str, Any]) -> dict[str, Any]:
+    def _process(dialogue: dict[str, Any]) -> SampleResult:
         sample_dir = output_dir / "samples" / dialogue["sample_id"]
         sample_json_path = sample_dir / "sample.json"
         if resume and not force and sample_json_path.exists():
             sample = json.loads(sample_json_path.read_text(encoding="utf-8"))
+            status = "resumed"
             if config.sfx_enabled and config.sfx_audio_name not in sample.get("audio_files", {}):
                 sample = mix_sample_sfx(sample, sample_dir, config, force=force, catalog=sfx_catalog)
                 validate_sample_json(sample, sample_dir)
                 write_json(sample_dir / "metadata.json", {k: v for k, v in sample.items() if k != "chunk_targets"})
                 write_json(sample_json_path, sample)
+                status = "resumed_sfx"
             LOGGER.info("Skipping completed sample %s", dialogue["sample_id"])
-            return _manifest_row(sample)
+            return SampleResult(_manifest_row(sample), status)
 
         sample = build_sample(
             dialogue,
@@ -148,13 +192,23 @@ def run_pipeline(
             asr_fn=asr_fn,
             sfx_catalog=sfx_catalog,
         )
-        return _manifest_row(sample)
+        return SampleResult(_manifest_row(sample), "generated")
 
-    def _record_success(row: dict[str, Any]) -> None:
+    def _record_success(result: SampleResult) -> None:
+        row = result.row
         append_jsonl(manifest_path, row)
         manifest_rows.append(row)
+        stats[result.status] += 1
+        stats["duration_ms"] += int(row.get("duration_ms") or 0)
+        stats["turns"] += int(row.get("num_turns") or 0)
+        stats["chunks"] += int(row.get("num_chunks") or 0)
+        stats["overlap_events"] += int(row.get("num_overlaps") or 0)
+        stats["backchannel_events"] += int(row.get("num_backchannels") or 0)
+        stats["sfx_events"] += int(row.get("num_sfx_events") or 0)
+        _log_progress(row["sample_id"], result.status)
 
     def _record_failure(dialogue: dict[str, Any], exc: Exception) -> None:
+        stats["failed"] += 1
         LOGGER.exception("Failed to process %s", dialogue["sample_id"])
         append_jsonl(
             failed_path,
@@ -164,6 +218,61 @@ def run_pipeline(
                 "error": str(exc),
             },
         )
+        _log_progress(dialogue["sample_id"], "failed")
+
+    def _log_progress(sample_id: str, status: str) -> None:
+        completed = len(manifest_rows) + stats["failed"]
+        elapsed = time.perf_counter() - started_at
+        processed_per_min = (completed / elapsed * 60.0) if elapsed > 0 else 0.0
+        remaining = max(0, total - completed)
+        eta_seconds = (remaining / processed_per_min * 60.0) if processed_per_min > 0 else 0.0
+        LOGGER.info(
+            "Pipeline progress %s/%s: sample=%s status=%s elapsed=%s eta=%s "
+            "rate=%.2f samples/min audio_min=%.2f turns=%s chunks=%s "
+            "overlap_events=%s backchannel_events=%s sfx_events=%s "
+            "generated=%s resumed=%s resumed_sfx=%s failed=%s",
+            completed,
+            total,
+            sample_id,
+            status,
+            _format_elapsed(elapsed),
+            _format_elapsed(eta_seconds),
+            processed_per_min,
+            stats["duration_ms"] / 60000.0,
+            stats["turns"],
+            stats["chunks"],
+            stats["overlap_events"],
+            stats["backchannel_events"],
+            stats["sfx_events"],
+            stats["generated"],
+            stats["resumed"],
+            stats["resumed_sfx"],
+            stats["failed"],
+        )
+
+    def _log_summary() -> None:
+        elapsed = time.perf_counter() - started_at
+        succeeded = len(manifest_rows)
+        LOGGER.info(
+            "Finished pipeline: samples=%s succeeded=%s failed=%s elapsed=%s "
+            "rate=%.2f samples/min audio_min=%.2f turns=%s chunks=%s "
+            "overlap_events=%s backchannel_events=%s sfx_events=%s "
+            "generated=%s resumed=%s resumed_sfx=%s",
+            total,
+            succeeded,
+            stats["failed"],
+            _format_elapsed(elapsed),
+            (succeeded / elapsed * 60.0) if elapsed > 0 else 0.0,
+            stats["duration_ms"] / 60000.0,
+            stats["turns"],
+            stats["chunks"],
+            stats["overlap_events"],
+            stats["backchannel_events"],
+            stats["sfx_events"],
+            stats["generated"],
+            stats["resumed"],
+            stats["resumed_sfx"],
+        )
 
     if worker_count == 1:
         for dialogue in dialogues:
@@ -171,6 +280,7 @@ def run_pipeline(
                 _record_success(_process(dialogue))
             except Exception as exc:
                 _record_failure(dialogue, exc)
+        _log_summary()
         return manifest_rows
 
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -182,6 +292,7 @@ def run_pipeline(
             except Exception as exc:
                 _record_failure(dialogue, exc)
 
+    _log_summary()
     return manifest_rows
 
 
@@ -882,6 +993,9 @@ def _manifest_row(sample: dict[str, Any]) -> dict[str, Any]:
         "source_dialogue_id": sample["source_dialogue_id"],
         "sample_json": f"samples/{sample['sample_id']}/sample.json",
         "duration_ms": sample["duration_ms"],
+        "num_turns": len(sample.get("turns", [])),
         "num_chunks": sample.get("num_chunks", 0),
         "num_overlaps": len(sample.get("overlap_events", [])),
+        "num_backchannels": len(sample.get("backchannel_events", [])),
+        "num_sfx_events": len(sample.get("sfx_events", [])),
     }
