@@ -7,7 +7,7 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from pipeline.config import PipelineConfig
-from pipeline.sfx_mixer import load_sfx_catalog, mix_sample_sfx
+from pipeline.sfx_mixer import SfxAsset, _build_prompt, load_sfx_catalog, mix_sample_sfx
 
 
 def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
@@ -109,3 +109,34 @@ def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
     assert mixed_sample["sfx_events"][0]["label"] == "laughter"
     assert mixed_sample["sfx_events"][0]["asset_path"].endswith("laugh_asset__part001.wav")
     assert AudioSegment.from_file(mixed_path).channels == 2
+
+
+def test_sfx_prompt_prefers_human_sounds_without_forbidding_grounded_context(tmp_path):
+    catalog = {
+        ("Human sounds", "laughter"): [
+            SfxAsset("Human sounds", "laughter", "laugh/laugh.wav", tmp_path / "laugh.wav")
+        ],
+        ("Sounds of things", "doors_windows_locks"): [
+            SfxAsset("Sounds of things", "doors_windows_locks", "door/door.wav", tmp_path / "door.wav")
+        ],
+    }
+    sample = {
+        "duration_ms": 2000,
+        "turns": [
+            {
+                "turn_id": "u1",
+                "stream": "user_voice",
+                "start_ms": 0,
+                "end_ms": 500,
+                "text": "That was funny, then someone opened the door.",
+            }
+        ],
+    }
+    config = PipelineConfig(input_json="input.json", output_dir=str(tmp_path / "out"))
+
+    prompt = _build_prompt(sample, catalog, config)
+
+    assert "Default to subtle Human sounds" in prompt
+    assert "Use non-human categories only when the dialogue text explicitly grounds them" in prompt
+    assert "ordinary dialogue" in prompt
+    assert "doors_windows_locks" in prompt
