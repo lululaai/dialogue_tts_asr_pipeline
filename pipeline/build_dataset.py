@@ -17,12 +17,14 @@ from .align_chunks import (
 )
 from .audio_utils import build_stream_tracks, ensure_ffmpeg_available, overlay_backchannel_events
 from .config import PipelineConfig
+from .google_limiter import configure_google_request_limit
 from .load_dialogues import load_dialogues
 from .openai_audio import (
     transcribe_audio_chunk,
     transcribe_audio_turn_with_word_timestamps,
 )
 from .schemas import validate_sample_json
+from .sfx_mixer import SfxCatalog, load_sfx_catalog, mix_sample_sfx
 
 LOGGER = logging.getLogger(__name__)
 
@@ -103,6 +105,7 @@ def run_pipeline(
     asr_fn: ASRFn | None = None,
 ) -> list[dict[str, Any]]:
     ensure_ffmpeg_available()
+    configure_google_request_limit(config.google_request_concurrency)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = output_dir / "manifest.jsonl"
@@ -116,43 +119,68 @@ def run_pipeline(
     dialogues = load_dialogues(config.input_json, config)
     if limit is not None:
         dialogues = dialogues[:limit]
+    sfx_catalog = load_sfx_catalog(config) if config.sfx_enabled else None
 
     manifest_rows: list[dict[str, Any]] = []
-    for dialogue in dialogues:
+    worker_count = max(1, config.sample_concurrency)
+
+    def _process(dialogue: dict[str, Any]) -> dict[str, Any]:
         sample_dir = output_dir / "samples" / dialogue["sample_id"]
         sample_json_path = sample_dir / "sample.json"
         if resume and not force and sample_json_path.exists():
             sample = json.loads(sample_json_path.read_text(encoding="utf-8"))
-            row = _manifest_row(sample)
-            append_jsonl(manifest_path, row)
-            manifest_rows.append(row)
+            if config.sfx_enabled and config.sfx_audio_name not in sample.get("audio_files", {}):
+                sample = mix_sample_sfx(sample, sample_dir, config, force=force, catalog=sfx_catalog)
+                validate_sample_json(sample, sample_dir)
+                write_json(sample_dir / "metadata.json", {k: v for k, v in sample.items() if k != "chunk_targets"})
+                write_json(sample_json_path, sample)
             LOGGER.info("Skipping completed sample %s", dialogue["sample_id"])
-            continue
+            return _manifest_row(sample)
 
-        try:
-            sample = build_sample(
-                dialogue,
-                config,
-                sample_dir,
-                skip_tts=skip_tts,
-                skip_asr=skip_asr,
-                force=force,
-                tts_fn=tts_fn,
-                asr_fn=asr_fn,
-            )
-            row = _manifest_row(sample)
-            append_jsonl(manifest_path, row)
-            manifest_rows.append(row)
-        except Exception as exc:
-            LOGGER.exception("Failed to process %s", dialogue["sample_id"])
-            append_jsonl(
-                failed_path,
-                {
-                    "sample_id": dialogue["sample_id"],
-                    "source_dialogue_id": dialogue["source_dialogue_id"],
-                    "error": str(exc),
-                },
-            )
+        sample = build_sample(
+            dialogue,
+            config,
+            sample_dir,
+            skip_tts=skip_tts,
+            skip_asr=skip_asr,
+            force=force,
+            tts_fn=tts_fn,
+            asr_fn=asr_fn,
+            sfx_catalog=sfx_catalog,
+        )
+        return _manifest_row(sample)
+
+    def _record_success(row: dict[str, Any]) -> None:
+        append_jsonl(manifest_path, row)
+        manifest_rows.append(row)
+
+    def _record_failure(dialogue: dict[str, Any], exc: Exception) -> None:
+        LOGGER.exception("Failed to process %s", dialogue["sample_id"])
+        append_jsonl(
+            failed_path,
+            {
+                "sample_id": dialogue["sample_id"],
+                "source_dialogue_id": dialogue["source_dialogue_id"],
+                "error": str(exc),
+            },
+        )
+
+    if worker_count == 1:
+        for dialogue in dialogues:
+            try:
+                _record_success(_process(dialogue))
+            except Exception as exc:
+                _record_failure(dialogue, exc)
+        return manifest_rows
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_dialogue = {executor.submit(_process, dialogue): dialogue for dialogue in dialogues}
+        for future in as_completed(future_to_dialogue):
+            dialogue = future_to_dialogue[future]
+            try:
+                _record_success(future.result())
+            except Exception as exc:
+                _record_failure(dialogue, exc)
 
     return manifest_rows
 
@@ -167,6 +195,7 @@ def build_sample(
     force: bool = False,
     tts_fn: TTSFn | None = None,
     asr_fn: ASRFn | None = None,
+    sfx_catalog: SfxCatalog | None = None,
 ) -> dict[str, Any]:
     sample_dir = Path(sample_dir)
     turn_audio_dir = sample_dir / "audio" / "turns"
@@ -296,6 +325,9 @@ def build_sample(
             config,
             num_chunks,
         )
+
+    if config.sfx_enabled:
+        sample = mix_sample_sfx(sample, sample_dir, config, force=force, catalog=sfx_catalog)
 
     validate_sample_json(sample, sample_dir)
     write_json(sample_dir / "metadata.json", {k: v for k, v in sample.items() if k != "chunk_targets"})

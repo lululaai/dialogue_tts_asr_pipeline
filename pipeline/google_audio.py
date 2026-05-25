@@ -17,6 +17,7 @@ import requests
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .audio_utils import normalize_wav_file
+from .google_limiter import google_request_slot
 
 _TOKEN_LOCK = threading.Lock()
 _CACHED_TOKEN: str | None = None
@@ -203,34 +204,35 @@ def synthesize_tts(
             f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}"
             f"/locations/{location}/publishers/google/models/{model}:generateContent"
         )
-        response = requests.post(
-            endpoint,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "x-goog-user-project": project_id,
-                "Content-Type": "application/json",
-            },
-            json={
-                "contents": {
-                    "role": "user",
-                    "parts": {
-                        "text": _build_contents(text, instructions, speed),
-                    },
+        with google_request_slot():
+            response = requests.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "x-goog-user-project": project_id,
+                    "Content-Type": "application/json",
                 },
-                "generation_config": {
-                    "speech_config": {
-                        "language_code": os.getenv("GOOGLE_TTS_LANGUAGE_CODE", "en-US"),
-                        "voice_config": {
-                            "prebuilt_voice_config": {
-                                "voice_name": voice,
-                            },
+                json={
+                    "contents": {
+                        "role": "user",
+                        "parts": {
+                            "text": _build_contents(text, instructions, speed),
                         },
                     },
-                    "temperature": 2.0,
+                    "generation_config": {
+                        "speech_config": {
+                            "language_code": os.getenv("GOOGLE_TTS_LANGUAGE_CODE", "en-US"),
+                            "voice_config": {
+                                "prebuilt_voice_config": {
+                                    "voice_name": voice,
+                                },
+                            },
+                        },
+                        "temperature": 2.0,
+                    },
                 },
-            },
-            timeout=120,
-        )
+                timeout=120,
+            )
         if not response.ok:
             raise RuntimeError(f"Google TTS request failed: {response.status_code} {response.text}")
         data = response.json()

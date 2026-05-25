@@ -51,6 +51,7 @@ class PipelineConfig:
     user_voice_name: str = "user_voice"
     assistant_voice_name: str = "assistant_voice"
     stereo_audio_name: str = "duplex_stereo"
+    sfx_audio_name: str = "duplex_stereo_sfx"
 
     user_tts_voice: str = "Kore"
     assistant_tts_voice: str = "Puck"
@@ -109,6 +110,18 @@ class PipelineConfig:
 
     tts_concurrency: int = 0
     asr_concurrency: int = 6
+    sample_concurrency: int = 1
+    google_request_concurrency: int = 8
+
+    sfx_enabled: bool = False
+    sfx_map_path: str = "uploaded_segments_map_to_file.json"
+    sfx_root: str = "sfx"
+    sfx_planner_model: str = "gemini-2.5-flash"
+    sfx_max_events: int = 4
+    sfx_default_gain_db: float = -18.0
+    sfx_ducking_db: float = -2.0
+    sfx_fade_ms: int = 20
+    sfx_random_seed: int = 42
 
     @property
     def agent_to_stream(self) -> dict[str, str]:

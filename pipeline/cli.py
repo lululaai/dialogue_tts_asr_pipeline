@@ -74,7 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="TTS worker count. 0 means one concurrent request per turn/backchannel item.",
     )
     parser.add_argument("--asr-concurrency", type=int, default=6)
+    parser.add_argument("--sample-concurrency", type=int, default=1)
+    parser.add_argument("--google-request-concurrency", type=int, default=8)
     parser.add_argument("--max-retries", type=int, default=5)
+    parser.add_argument("--sfx-enabled", type=parse_bool, default=False)
+    parser.add_argument("--sfx-map-path", default="uploaded_segments_map_to_file.json")
+    parser.add_argument("--sfx-root", default="sfx")
+    parser.add_argument("--sfx-planner-model", default="gemini-2.5-flash")
+    parser.add_argument("--sfx-max-events", type=int, default=4)
+    parser.add_argument("--sfx-default-gain-db", type=float, default=-18.0)
+    parser.add_argument("--sfx-ducking-db", type=float, default=-2.0)
+    parser.add_argument("--sfx-fade-ms", type=int, default=20)
+    parser.add_argument("--sfx-random-seed", type=int, default=42)
     parser.add_argument("--log-level", default="INFO")
     return parser
 
@@ -126,6 +137,17 @@ def main(argv: list[str] | None = None) -> int:
         backchannel_phrases=tuple(phrase.strip() for phrase in args.backchannel_phrases.split(",") if phrase.strip()),
         tts_concurrency=args.tts_concurrency,
         asr_concurrency=args.asr_concurrency,
+        sample_concurrency=args.sample_concurrency,
+        google_request_concurrency=args.google_request_concurrency,
+        sfx_enabled=args.sfx_enabled,
+        sfx_map_path=args.sfx_map_path,
+        sfx_root=args.sfx_root,
+        sfx_planner_model=args.sfx_planner_model,
+        sfx_max_events=args.sfx_max_events,
+        sfx_default_gain_db=args.sfx_default_gain_db,
+        sfx_ducking_db=args.sfx_ducking_db,
+        sfx_fade_ms=args.sfx_fade_ms,
+        sfx_random_seed=args.sfx_random_seed,
     )
     run_pipeline(
         config,

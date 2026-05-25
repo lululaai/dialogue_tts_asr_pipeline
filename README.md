@@ -61,7 +61,14 @@ pipeline synthesizes short listener responses such as `yes`, `yeah`, or `right`
 with the listener's voice and overlays them quietly on the listener stream.
 These do not become dialogue turns; they are recorded in `backchannel_events`.
 
-Useful overlap flags:
+Optional SFX mixing can add a sparse human-sound layer on top of
+`duplex_stereo.wav`. It uses a Google Gemini text model to plan events, but the
+actual event audio is selected only from `uploaded_segments_map_to_file.json`
+and local files under `sfx/audio_segments/...`, matching the TOS key layout.
+The original stereo file is preserved and the mixed file is written as
+`audio/duplex_stereo_sfx.wav`.
+
+Useful overlap and batch flags:
 
 ```bash
 --turn-overlap-enabled true
@@ -77,7 +84,32 @@ Useful overlap flags:
 --backchannel-min-end-margin-ms 650
 --backchannel-gain-db -5
 --backchannel-phrases "yes,yeah,yep,right,correct,exactly,true,that's right,you are right,I agree,sure,of course,totally,absolutely"
---tts-concurrency 0
+--sfx-enabled true
+--sfx-root sfx
+--sfx-map-path uploaded_segments_map_to_file.json
+--sfx-planner-model gemini-2.5-flash
+--sfx-max-events 4
+--sample-concurrency 4
+--tts-concurrency 4
+--google-request-concurrency 8
+```
+
+For large batches, `--sample-concurrency` runs multiple dialogues at once while
+`--google-request-concurrency` caps total concurrent Google TTS and SFX planner
+requests across the whole process. A practical starting point on a medium
+server is:
+
+```bash
+python3 -m pipeline.cli \
+  --input-json data/test_freq.json \
+  --output-dir output \
+  --tts-provider google \
+  --tts-model gemini-2.5-flash-tts \
+  --sfx-enabled true \
+  --sample-concurrency 4 \
+  --tts-concurrency 4 \
+  --google-request-concurrency 8 \
+  --resume
 ```
 
 The older chunk/ASR target path is still available by opting in:
@@ -144,6 +176,7 @@ output/
         user_voice.wav
         assistant_voice.wav
         duplex_stereo.wav
+        duplex_stereo_sfx.wav  # when --sfx-enabled true
 ```
 
 When `--generate-chunk-targets true` is used, the sample also includes
@@ -164,7 +197,8 @@ output/
 
 `sample.json` records the final `turns` timeline, an `overlap_events` array
 that identifies which turns overlap, and a `backchannel_events` array for
-listener acknowledgements.
+listener acknowledgements. When SFX mixing is enabled, it also records
+`sfx_events` and `audio_files.duplex_stereo_sfx`.
 
 ## Tests
 
