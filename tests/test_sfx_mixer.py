@@ -111,7 +111,7 @@ def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
     assert AudioSegment.from_file(mixed_path).channels == 2
 
 
-def test_sfx_prompt_prefers_human_sounds_without_forbidding_grounded_context(tmp_path):
+def test_sfx_prompt_matches_dialogue_cues_without_category_bias(tmp_path):
     catalog = {
         ("Human sounds", "laughter"): [
             SfxAsset("Human sounds", "laughter", "laugh/laugh.wav", tmp_path / "laugh.wav")
@@ -136,7 +136,7 @@ def test_sfx_prompt_prefers_human_sounds_without_forbidding_grounded_context(tmp
 
     prompt = _build_prompt(sample, catalog, config)
 
-    assert "Default to subtle Human sounds" in prompt
-    assert "Use non-human categories only when the dialogue text explicitly grounds them" in prompt
-    assert "ordinary dialogue" in prompt
+    assert "Do not prefer any category by default" in prompt
+    assert "Choose each event by the strongest cue in the dialogue text" in prompt
+    assert "Use Human sounds only when the cue is human" in prompt
     assert "doors_windows_locks" in prompt
