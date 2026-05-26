@@ -7,7 +7,15 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from pipeline.config import PipelineConfig
-from pipeline.sfx_mixer import SfxAsset, SFX_SCENES, _build_prompt, load_sfx_catalog, mix_sample_sfx
+from pipeline.sfx_mixer import (
+    SfxAsset,
+    SFX_SCENES,
+    _build_sfx_system_prompt,
+    _build_sfx_user_prompt,
+    _plan_sfx_events,
+    load_sfx_catalog,
+    mix_sample_sfx,
+)
 
 
 def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
@@ -73,7 +81,11 @@ def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
         sfx_max_events=1,
     )
 
-    def fake_generate_json(*_, **__):
+    captured_call = {}
+
+    def fake_generate_json(prompt, **kwargs):
+        captured_call["prompt"] = prompt
+        captured_call["kwargs"] = kwargs
         return {
             "scene": "indoor_room_chat",
             "scene_reason": "the funny line happens in a simple indoor conversation",
@@ -117,9 +129,12 @@ def test_sfx_mixer_selects_only_uploaded_map_assets(tmp_path, monkeypatch):
     assert mixed_sample["sfx_events"][0]["duration_ms"] == 400
     assert mixed_sample["sfx_events"][0]["asset_path"].endswith("laugh_asset__part001.wav")
     assert AudioSegment.from_file(mixed_path).channels == 2
+    assert captured_call["kwargs"]["system_instruction"]
+    assert "that was funny" in captured_call["prompt"]
+    assert "that was funny" not in captured_call["kwargs"]["system_instruction"]
 
 
-def test_sfx_prompt_matches_dialogue_cues_without_category_bias(tmp_path):
+def test_sfx_prompts_split_static_instructions_from_sample_payload(tmp_path):
     catalog = {
         ("Human sounds", "laughter"): [
             SfxAsset("Human sounds", "laughter", "laugh/laugh.wav", tmp_path / "laugh.wav")
@@ -142,18 +157,49 @@ def test_sfx_prompt_matches_dialogue_cues_without_category_bias(tmp_path):
     }
     config = PipelineConfig(input_json="input.json", output_dir=str(tmp_path / "out"))
 
-    prompt = _build_prompt(sample, catalog, config)
-    prompt_data = json.loads(prompt)
+    system_prompt = _build_sfx_system_prompt(catalog, config)
+    user_prompt = _build_sfx_user_prompt(sample)
+    system_data = json.loads(system_prompt)
+    user_data = json.loads(user_prompt)
 
     assert len(SFX_SCENES) == 20
-    assert len(prompt_data["available_scenes"]) == 20
-    assert "indoor_argument" in prompt
-    assert "restaurant_chat" in prompt
-    assert "rainy_street_chat" in prompt
-    assert "factory_workshop_chat" in prompt
-    assert "Do not prefer any category by default" in prompt
-    assert "Choose each event by the strongest cue in the dialogue text" in prompt
-    assert "Use Human sounds only when the cue is human" in prompt
-    assert "Choose start_ms and end_ms flexibly" in prompt
-    assert "Choose intensity from 1 to 5" in prompt
-    assert "doors_windows_locks" in prompt
+    assert len(system_data["available_scenes"]) == 20
+    assert system_data["input_format"]["turns"] == ["turn_id", "stream", "start_ms", "end_ms", "text"]
+    assert system_data["input_format"]["available_sfx_labels"] == ["category", "label", "asset_count"]
+    assert ["Sounds of things", "doors_windows_locks", 1] in system_data["available_sfx_labels"]
+    assert "indoor_argument" in system_prompt
+    assert "restaurant_chat" in system_prompt
+    assert "rainy_street_chat" in system_prompt
+    assert "factory_workshop_chat" in system_prompt
+    assert "Do not prefer any category by default" in system_prompt
+    assert "Choose each event by the strongest cue in the dialogue text" in system_prompt
+    assert "Use Human sounds only when the cue is human" in system_prompt
+    assert "Choose start_ms and end_ms flexibly" in system_prompt
+    assert "Choose intensity from 1 to 5" in system_prompt
+    assert "That was funny" not in system_prompt
+
+    assert user_data["duration_ms"] == 2000
+    assert user_data["turns"] == [["u1", "user_voice", 0, 500, "That was funny, then someone opened the door."]]
+    assert "rules" not in user_data
+    assert "available_scenes" not in user_data
+    assert "available_sfx_labels" not in user_data
+
+
+def test_sfx_planner_skips_gemini_when_max_events_is_zero(tmp_path, monkeypatch):
+    def fail_generate_json(*args, **kwargs):
+        raise AssertionError("generate_json should not be called")
+
+    monkeypatch.setattr("pipeline.sfx_mixer.generate_json", fail_generate_json)
+    config = PipelineConfig(input_json="input.json", output_dir=str(tmp_path / "out"), sfx_max_events=0)
+    sample = {"sample_id": "dialogue_000001", "duration_ms": 1000, "turns": []}
+    catalog = {
+        ("Human sounds", "laughter"): [
+            SfxAsset("Human sounds", "laughter", "laugh.wav", tmp_path / "laugh.wav")
+        ]
+    }
+
+    assert _plan_sfx_events(sample, catalog, config) == {
+        "scene": None,
+        "scene_reason": "sfx_max_events is 0",
+        "events": [],
+    }

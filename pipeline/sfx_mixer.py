@@ -233,39 +233,47 @@ def _plan_sfx_events(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
+    if config.sfx_max_events <= 0:
+        return {"scene": None, "scene_reason": "sfx_max_events is 0", "events": []}
     plan_cache = Path(config.output_dir) / "cache" / "sfx_plans" / f"{sample['sample_id']}.json"
     if plan_cache.exists() and not force:
         return json.loads(plan_cache.read_text(encoding="utf-8"))
-    prompt = _build_prompt(sample, catalog, config)
-    plan = generate_json(prompt, model=config.sfx_planner_model, max_retries=config.max_retries)
+    system_instruction = _build_sfx_system_prompt(catalog, config)
+    prompt = _build_sfx_user_prompt(sample)
+    plan = generate_json(
+        prompt,
+        model=config.sfx_planner_model,
+        system_instruction=system_instruction,
+        max_retries=config.max_retries,
+    )
     plan_cache.parent.mkdir(parents=True, exist_ok=True)
     plan_cache.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
     return plan
 
 
-def _build_prompt(
-    sample: dict[str, Any],
+def _build_sfx_system_prompt(
     catalog: SfxCatalog,
     config: PipelineConfig,
 ) -> str:
     labels = [
-        {"category": category, "label": label, "asset_count": len(assets)}
+        [category, label, len(assets)]
         for (category, label), assets in sorted(catalog.items())
     ]
-    turns = [
+    scenes = [
         {
-            "turn_id": turn["turn_id"],
-            "speaker": turn["stream"],
-            "start_ms": turn["start_ms"],
-            "end_ms": turn["end_ms"],
-            "text": turn["text"],
+            "scene": scene["scene"],
+            "cues": scene["cues"],
         }
-        for turn in sample.get("turns", [])
+        for scene in SFX_SCENES
     ]
-    gaps = _dialogue_gaps(turns, int(sample["duration_ms"]))
     return json.dumps(
         {
             "task": "Create a sparse, dialogue-safe sound-effect plan for a stereo two-speaker dialogue mix.",
+            "input_format": {
+                "turns": ["turn_id", "stream", "start_ms", "end_ms", "text"],
+                "dialogue_gaps": ["start_ms", "end_ms", "duration_ms"],
+                "available_sfx_labels": ["category", "label", "asset_count"],
+            },
             "rules": [
                 "Return only valid JSON.",
                 "First choose one scene from available_scenes that best fits the dialogue. If no scene is explicit, infer the most natural low-risk scene from the text.",
@@ -292,11 +300,51 @@ def _build_prompt(
                 "silence_is_ok": "Return fewer than max_events if extra sounds would feel ungrounded or repetitive.",
             },
             "max_events": config.sfx_max_events,
-            "available_scenes": SFX_SCENES,
-            "duration_ms": sample["duration_ms"],
+            "available_scenes": scenes,
             "available_sfx_labels": labels,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _build_sfx_user_prompt(sample: dict[str, Any]) -> str:
+    turn_dicts = [
+        {
+            "start_ms": turn["start_ms"],
+            "end_ms": turn["end_ms"],
+        }
+        for turn in sample.get("turns", [])
+    ]
+    turns = [
+        [
+            turn["turn_id"],
+            turn["stream"],
+            turn["start_ms"],
+            turn["end_ms"],
+            turn["text"],
+        ]
+        for turn in sample.get("turns", [])
+    ]
+    gaps = _dialogue_gaps(turn_dicts, int(sample["duration_ms"]))
+    return json.dumps(
+        {
+            "duration_ms": sample["duration_ms"],
             "dialogue_gaps": gaps[:24],
             "turns": turns[:80],
+        },
+        ensure_ascii=False,
+    )
+
+
+def _build_prompt(
+    sample: dict[str, Any],
+    catalog: SfxCatalog,
+    config: PipelineConfig,
+) -> str:
+    return json.dumps(
+        {
+            "system_instruction": json.loads(_build_sfx_system_prompt(catalog, config)),
+            "user": json.loads(_build_sfx_user_prompt(sample)),
         },
         ensure_ascii=False,
     )

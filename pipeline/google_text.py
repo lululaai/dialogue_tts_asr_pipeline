@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
 
@@ -10,11 +11,14 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 from .google_audio import _get_access_token, _resolve_project_id
 from .google_limiter import google_request_slot
 
+LOGGER = logging.getLogger(__name__)
+
 
 def generate_json(
     prompt: str,
     *,
     model: str,
+    system_instruction: str | None = None,
     temperature: float = 0.2,
     max_retries: int = 5,
 ) -> dict[str, Any]:
@@ -33,6 +37,22 @@ def generate_json(
             f"https://aiplatform.googleapis.com/v1beta1/projects/{project_id}"
             f"/locations/{location}/publishers/google/models/{model}:generateContent"
         )
+        request_body: dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "responseMimeType": "application/json",
+            },
+        }
+        if system_instruction:
+            request_body["systemInstruction"] = {
+                "parts": [{"text": system_instruction}],
+            }
         with google_request_slot():
             response = requests.post(
                 endpoint,
@@ -41,23 +61,16 @@ def generate_json(
                     "x-goog-user-project": project_id,
                     "Content-Type": "application/json",
                 },
-                json={
-                    "contents": [
-                        {
-                            "role": "user",
-                            "parts": [{"text": prompt}],
-                        }
-                    ],
-                    "generationConfig": {
-                        "temperature": temperature,
-                        "responseMimeType": "application/json",
-                    },
-                },
+                json=request_body,
                 timeout=120,
             )
         if not response.ok:
             raise RuntimeError(f"Google text request failed: {response.status_code} {response.text}")
-        text = _extract_text(response.json())
+        payload = response.json()
+        usage_metadata = payload.get("usageMetadata") or payload.get("usage_metadata")
+        if usage_metadata:
+            LOGGER.debug("Google text usage metadata: %s", usage_metadata)
+        text = _extract_text(payload)
         try:
             return json.loads(text)
         except json.JSONDecodeError as exc:
