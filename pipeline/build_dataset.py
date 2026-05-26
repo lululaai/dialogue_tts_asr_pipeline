@@ -38,6 +38,7 @@ ASRFn = Callable[..., dict[str, Any]]
 class SampleResult:
     row: dict[str, Any]
     status: str
+    write_manifest: bool = True
 
 
 def write_json(path: str | Path, data: dict[str, Any]) -> None:
@@ -51,6 +52,25 @@ def append_jsonl(path: str | Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def _load_manifest_rows(path: str | Path) -> dict[str, dict[str, Any]]:
+    path = Path(path)
+    if not path.exists():
+        return {}
+    rows: dict[str, dict[str, Any]] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            LOGGER.warning("Ignoring invalid manifest row %s in %s", line_number, path)
+            continue
+        sample_id = row.get("sample_id")
+        if isinstance(sample_id, str) and sample_id:
+            rows[sample_id] = row
+    return rows
 
 
 def _resolve_tts_fn(config: PipelineConfig, tts_fn: TTSFn | None) -> TTSFn:
@@ -131,6 +151,7 @@ def run_pipeline(
     if not resume:
         manifest_path.unlink(missing_ok=True)
         failed_path.unlink(missing_ok=True)
+    completed_manifest_rows = _load_manifest_rows(manifest_path) if resume and not force else {}
 
     tts_fn = _resolve_tts_fn(config, tts_fn)
     dialogues = load_dialogues(config.input_json, config)
@@ -169,17 +190,27 @@ def run_pipeline(
     def _process(dialogue: dict[str, Any]) -> SampleResult:
         sample_dir = output_dir / "samples" / dialogue["sample_id"]
         sample_json_path = sample_dir / "sample.json"
-        if resume and not force and sample_json_path.exists():
-            sample = json.loads(sample_json_path.read_text(encoding="utf-8"))
-            status = "resumed"
-            if config.sfx_enabled and config.sfx_audio_name not in sample.get("audio_files", {}):
-                sample = mix_sample_sfx(sample, sample_dir, config, force=force, catalog=sfx_catalog)
-                validate_sample_json(sample, sample_dir)
-                write_json(sample_dir / "metadata.json", {k: v for k, v in sample.items() if k != "chunk_targets"})
-                write_json(sample_json_path, sample)
-                status = "resumed_sfx"
-            LOGGER.info("Skipping completed sample %s", dialogue["sample_id"])
-            return SampleResult(_manifest_row(sample), status)
+        if resume and not force:
+            if sample_json_path.exists():
+                sample = json.loads(sample_json_path.read_text(encoding="utf-8"))
+                status = "resumed"
+                if config.sfx_enabled and config.sfx_audio_name not in sample.get("audio_files", {}):
+                    sample = mix_sample_sfx(sample, sample_dir, config, force=force, catalog=sfx_catalog)
+                    validate_sample_json(sample, sample_dir)
+                    write_json(sample_dir / "metadata.json", {k: v for k, v in sample.items() if k != "chunk_targets"})
+                    write_json(sample_json_path, sample)
+                    status = "resumed_sfx"
+                LOGGER.info("Skipping completed sample %s from sample.json", dialogue["sample_id"])
+                return SampleResult(
+                    _manifest_row(sample),
+                    status,
+                    write_manifest=dialogue["sample_id"] not in completed_manifest_rows or status == "resumed_sfx",
+                )
+
+            manifest_row = completed_manifest_rows.get(dialogue["sample_id"])
+            if manifest_row is not None:
+                LOGGER.info("Skipping completed sample %s from manifest", dialogue["sample_id"])
+                return SampleResult(manifest_row, "resumed", write_manifest=False)
 
         sample = build_sample(
             dialogue,
@@ -196,7 +227,8 @@ def run_pipeline(
 
     def _record_success(result: SampleResult) -> None:
         row = result.row
-        append_jsonl(manifest_path, row)
+        if result.write_manifest:
+            append_jsonl(manifest_path, row)
         manifest_rows.append(row)
         stats[result.status] += 1
         stats["duration_ms"] += int(row.get("duration_ms") or 0)

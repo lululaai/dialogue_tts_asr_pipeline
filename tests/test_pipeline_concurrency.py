@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 
 from pydub import AudioSegment
@@ -85,6 +86,34 @@ def test_run_pipeline_logs_elapsed_time_and_processed_data(tmp_path, caplog):
         for message in messages
     )
     assert any("Finished pipeline: samples=2 succeeded=2 failed=0" in message for message in messages)
+
+
+def test_resume_skips_manifest_rows_when_sample_dir_is_missing(tmp_path):
+    input_path = tmp_path / "input.json"
+    _write_multi_input(input_path, count=1)
+    output_dir = tmp_path / "out"
+    config = PipelineConfig(
+        input_json=str(input_path),
+        output_dir=str(output_dir),
+        sample_concurrency=1,
+        tts_concurrency=1,
+        asr_concurrency=1,
+        turn_overlap_enabled=False,
+        backchannel_enabled=False,
+    )
+
+    first_rows = run_pipeline(config, tts_fn=fake_tts, skip_asr=True)
+    shutil.rmtree(output_dir / "samples")
+    original_manifest = (output_dir / "manifest.jsonl").read_text(encoding="utf-8")
+
+    def fail_tts(*args, **kwargs):
+        raise AssertionError("resume should skip rows already recorded in manifest")
+
+    resumed_rows = run_pipeline(config, resume=True, tts_fn=fail_tts, skip_asr=True)
+
+    assert resumed_rows == first_rows
+    assert not (output_dir / "samples").exists()
+    assert (output_dir / "manifest.jsonl").read_text(encoding="utf-8") == original_manifest
 
 
 def test_resume_with_sfx_only_fills_missing_sfx_output(tmp_path, monkeypatch):
