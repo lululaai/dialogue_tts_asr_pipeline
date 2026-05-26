@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +13,8 @@ from pydub import AudioSegment
 
 from .config import PipelineConfig
 from .google_text import generate_json
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -240,11 +244,27 @@ def _plan_sfx_events(
         return json.loads(plan_cache.read_text(encoding="utf-8"))
     system_instruction = _build_sfx_system_prompt(catalog, config)
     prompt = _build_sfx_user_prompt(sample)
-    plan = generate_json(
-        prompt,
-        model=config.sfx_planner_model,
-        system_instruction=system_instruction,
-        max_retries=config.max_retries,
+    started_at = time.perf_counter()
+    try:
+        plan = generate_json(
+            prompt,
+            model=config.sfx_planner_model,
+            system_instruction=system_instruction,
+            max_retries=config.max_retries,
+        )
+    except Exception:
+        LOGGER.exception(
+            "SFX planner model call failed after %.3fs sample_id=%s model=%s",
+            time.perf_counter() - started_at,
+            sample["sample_id"],
+            config.sfx_planner_model,
+        )
+        raise
+    LOGGER.info(
+        "SFX planner model call completed in %.3fs sample_id=%s model=%s",
+        time.perf_counter() - started_at,
+        sample["sample_id"],
+        config.sfx_planner_model,
     )
     plan_cache.parent.mkdir(parents=True, exist_ok=True)
     plan_cache.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")

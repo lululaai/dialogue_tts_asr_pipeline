@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import threading
+import time
 import wave
 from base64 import b64decode
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,8 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_ex
 
 from .audio_utils import normalize_wav_file
 from .google_limiter import google_request_slot
+
+LOGGER = logging.getLogger(__name__)
 
 _TOKEN_LOCK = threading.Lock()
 _CACHED_TOKEN: str | None = None
@@ -241,7 +245,26 @@ def synthesize_tts(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_suffix(".raw_google.wav")
-    _write_pcm_wav(temp_path, _call_google())
+    started_at = time.perf_counter()
+    try:
+        pcm = _call_google()
+    except Exception:
+        LOGGER.exception(
+            "Google TTS model call failed after %.3fs model=%s voice=%s output=%s",
+            time.perf_counter() - started_at,
+            model,
+            voice,
+            output_path,
+        )
+        raise
+    LOGGER.info(
+        "Google TTS model call completed in %.3fs model=%s voice=%s output=%s",
+        time.perf_counter() - started_at,
+        model,
+        voice,
+        output_path,
+    )
+    _write_pcm_wav(temp_path, pcm)
     normalize_wav_file(temp_path, output_path, sample_rate)
     temp_path.unlink(missing_ok=True)
     _dump_json(metadata_path, metadata)

@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Any
 
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from .audio_utils import is_silence, normalize_wav_file
+
+LOGGER = logging.getLogger(__name__)
 
 
 def sha256_text(value: str) -> str:
@@ -166,7 +170,26 @@ def synthesize_tts(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = output_path.with_suffix(f".raw.{response_format}")
-    temp_path.write_bytes(_call_openai())
+    started_at = time.perf_counter()
+    try:
+        audio_bytes = _call_openai()
+    except Exception:
+        LOGGER.exception(
+            "OpenAI TTS model call failed after %.3fs model=%s voice=%s output=%s",
+            time.perf_counter() - started_at,
+            model,
+            voice,
+            output_path,
+        )
+        raise
+    LOGGER.info(
+        "OpenAI TTS model call completed in %.3fs model=%s voice=%s output=%s",
+        time.perf_counter() - started_at,
+        model,
+        voice,
+        output_path,
+    )
+    temp_path.write_bytes(audio_bytes)
     normalize_wav_file(temp_path, output_path, sample_rate)
     temp_path.unlink(missing_ok=True)
     _dump_json(metadata_path, metadata)
